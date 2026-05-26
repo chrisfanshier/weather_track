@@ -1,0 +1,63 @@
+import requests
+import pandas as pd
+import re
+
+def get_official_kalshi_actuals(start_date, end_date):
+    print(f"Connecting to NWS Text Archive via IEM CGI Server...")
+    print(f"Targeting Product: CLIMIA (Miami) | Range: {start_date} to {end_date}\n")
+    
+    url = "https://mesonet.agron.iastate.edu/cgi-bin/afos/retrieve.py"
+    
+    # We pass the exact parameters from the test run that yielded data
+    params = {
+        "pil": "CLIMIA",                 
+        "sdate": start_date,             
+        "edate": end_date,               
+        "fmt": "text",
+        "limit": 9999  # Raised limit to allow a full year of text chunks to pass
+    }
+    
+    response = requests.get(url, params=params)
+    response.raise_for_status()
+    
+    # Split text payload exactly how the successful test did
+    raw_products = response.text.split("\n\n")
+    
+    parsed_records = []
+    
+    for product in raw_products:
+        if not product.strip() or "TEMPERATURE" not in product:
+            continue
+            
+        # The exact regex matcher that caught the 88°, 89°, 91° integers earlier
+        temp_match = re.search(r'MAXIMUM\s+(\d{2,3})', product)
+        
+        if temp_match:
+            high_temp = int(temp_match.group(1))
+            
+            # Since the text headers shifted over the year, we can pull a fallback 
+            # timestamp marker directly from the raw text string to look at it
+            lines = product.split("\n")
+            date_line = next((line.strip() for line in lines if "VALID FOR" in line or "CLIMATE REPORT" in line or "METEOROLOGICAL" in line), "Unknown Date")
+            
+            parsed_records.append({
+                "source_text_header": date_line,
+                "kalshi_resolution_high": high_temp
+            })
+
+    df = pd.DataFrame(parsed_records)
+    return df
+
+if __name__ == "__main__":
+    # Expanded to run across the full 2025 calendar year
+    start = "2025-01-01"
+    end = "2025-12-31"
+    
+    result_df = get_official_kalshi_actuals(start, end)
+    
+    print("\n" + "="*60)
+    print("        RAW PARSED LOGS DATA FRAME FOR 2025")
+    print("="*60)
+    # Using to_string() ensures pandas prints the entire dataframe directly to your shell
+    print(result_df.to_string())
+    print("="*60)

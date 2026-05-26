@@ -1,0 +1,307 @@
+"""
+miami_ev.py
+
+Miami temperature market EV analyzer.
+
+Data sources:
+  - Kalshi:  KXHIGHMIA series, public API, no auth needed
+  - NWS:     MFL/98,78 gridpoint (KMIA direct grid cell)
+
+Usage:
+    pip install requests pandas scipy
+    python miami_ev.py
+"""
+
+import requests
+import pandas as pd
+import re
+from datetime import datetime, timedelta
+from scipy.stats import norm
+
+# ── Config ────────────────────────────────────────────────────────────────────
+KALSHI_BASE     = "https://external-api.kalshi.com/trade-api/v2"
+SERIES_TICKERS  = ["KXHIGHMIA", "KXHIGHMI"]   # try both; Kalshi naming varies
+NWS_GRID_URL    = "https://api.weather.gov/gridpoints/MFL/98,78"
+NWS_HEADERS     = {"User-Agent": "(miami-ev-tool, weather_arbitrage)"}
+
+KALSHI_FEE_RATE = 0.07    # fee = 0.07 * p * (1-p)
+MIN_EV_FLAG     = 10.0    # flag trades with |EV| > this %
+DAY_HOUR_START  = 7
+DAY_HOUR_END    = 19
+
+# ── 1. Kalshi ─────────────────────────────────────────────────────────────────
+def fetch_kalshi_markets(target_date_iso):
+    """
+    Fetch today's or tomorrow's open temperature markets for Miami.
+    Tries multiple series tickers. Returns list of parsed bucket dicts.
+    """
+    markets = []
+    for series in SERIES_TICKERS:
+        url = f"{KALSHI_BASE}/markets"
+        params = {"series_ticker": series, "status": "open"}
+        try:
+            r = requests.get(url, params=params, timeout=15)
+            r.raise_for_status()
+            raw = r.json().get("markets", [])
+            # Filter to target date in event_ticker (more reliable than title)
+            dated = [m for m in raw if target_date_iso.replace("-", "") in m.get("event_ticker", "")
+                     or target_date_iso in m.get("event_ticker", "")]
+            if not dated:
+                dated = raw   # fallback: take whatever is open
+            if dated:
+                print(f"  Found {len(dated)} markets under series {series}")
+                markets = dated
+                break
+        except Exception as e:
+            print(f"  Series {series} failed: {e}")
+            continue
+
+    if not markets:
+        return []
+
+    return [parse_bucket(m) for m in markets if parse_bucket(m) is not None]
+
+def parse_bucket(m):
+    """
+    Parse a Kalshi market dict into a clean bucket dict.
+    v2 API returns yes_bid / no_bid (bids only).
+    Ask = 100 - opposite_bid.
+    """
+    title    = m.get("subtitle") or m.get("title") or ""
+    yes_bid  = m.get("yes_bid") or 0
+    no_bid   = m.get("no_bid")  or 0
+    yes_ask  = 100 - no_bid
+    no_ask   = 100 - yes_bid
+    volume   = m.get("volume")  or 0
+    ticker   = m.get("ticker",  "")
+
+    low, high = parse_temp_range(title)
+    if low == 0 and high == 0:
+        return None
+
+    return {
+        "ticker":  ticker,
+        "label":   title.strip(),
+        "low":     low,
+        "high":    high,
+        "yes_bid": yes_bid,
+        "no_bid":  no_bid,
+        "yes_ask": yes_ask,
+        "no_ask":  no_ask,
+        "mkt_yes": yes_bid / 100,
+        "mkt_no":  no_bid  / 100,
+        "volume":  volume,
+    }
+
+def parse_temp_range(text):
+    """Extract (low, high) °F bounds from bucket label."""
+    t = text.lower()
+    m = re.search(r'(\d+)[°\s]*or[°\s]*below', t)
+    if m: return (-999, float(m.group(1)))
+    m = re.search(r'(\d+)[°\s]*or[°\s]*above', t)
+    if m: return (float(m.group(1)), 999)
+    m = re.search(r'(\d+)[°\s]*(?:to|-)[°\s]*(\d+)', t)
+    if m: return (float(m.group(1)), float(m.group(2)))
+    # Try bare numbers
+    nums = [float(x) for x in re.findall(r'\d+\.?\d*', t)]
+    if len(nums) >= 2: return (nums[0], nums[1])
+    return (0, 0)
+
+# ── 2. NWS forecast ───────────────────────────────────────────────────────────
+def fetch_nws_grid(target_date_iso):
+    """
+    Pull NWS gridpoint temperature array for KMIA (MFL 98,78).
+    Returns (forecast_high, sigma, hourly_temps_list).
+    sigma is derived from the spread of daytime temps — wider on
+    uncertain/convective days, tighter on stable days.
+    """
+    print(f"  Fetching NWS grid MFL/98,78 for {target_date_iso}...")
+    r = requests.get(NWS_GRID_URL, headers=NWS_HEADERS, timeout=20)
+    r.raise_for_status()
+    data = r.json()
+
+    entries = data["properties"]["temperature"]["values"]
+
+    # Extract hourly temps for target date during daytime hours
+    day_temps = []
+    all_target_temps = []
+    for entry in entries:
+        vt = entry["validTime"]
+        if target_date_iso not in vt:
+            continue
+        temp_f = entry["value"] * 9/5 + 32
+        all_target_temps.append(temp_f)
+        # Parse hour from ISO8601 duration string e.g. "2026-05-26T14:00:00+00:00/PT1H"
+        try:
+            dt_str = vt.split("/")[0]
+            dt = datetime.fromisoformat(dt_str.replace("Z", "+00:00"))
+            # Convert UTC to Eastern (EDT = UTC-4, EST = UTC-5)
+            local_hour = (dt.hour - 4) % 24
+            if DAY_HOUR_START <= local_hour <= DAY_HOUR_END:
+                day_temps.append((local_hour, temp_f))
+        except Exception:
+            all_target_temps.append(temp_f)
+
+    temps_to_use = [t for _, t in day_temps] if day_temps else all_target_temps
+    if not temps_to_use:
+        return None, None, []
+
+    forecast_high = max(temps_to_use)
+
+    # Sigma: derived from spread of temps near the peak
+    # Use top quartile variance as proxy for forecast uncertainty
+    sorted_t = sorted(temps_to_use, reverse=True)
+    top_n    = max(1, len(sorted_t) // 4)
+    top_vals = sorted_t[:top_n]
+    if len(top_vals) > 1:
+        spread = max(top_vals) - min(top_vals)
+        sigma  = max(spread / 2, 0.8)
+    else:
+        sigma = 2.0   # fallback for stable days with flat profile
+
+    # Floor and ceiling: Miami is predictable, cap sigma at 4°F
+    sigma = min(max(sigma, 0.8), 4.0)
+
+    return forecast_high, sigma, day_temps
+
+# ── 3. Probability model ──────────────────────────────────────────────────────
+def bucket_model_prob(low, high, forecast_high, sigma):
+    """
+    P(daily high lands in [low, high]) under N(forecast_high, sigma).
+    Handles open-ended tails.
+    """
+    lo = -999 if low  == -999 else low  - 0.5
+    hi =  999 if high ==  999 else high + 0.5
+    return norm.cdf(hi, forecast_high, sigma) - norm.cdf(lo, forecast_high, sigma)
+
+def model_probs(buckets, forecast_high, sigma):
+    """Compute and normalize model probabilities for all buckets."""
+    raw = {b["label"]: bucket_model_prob(b["low"], b["high"], forecast_high, sigma)
+           for b in buckets}
+    total = sum(raw.values())
+    return {k: v / total for k, v in raw.items()} if total > 0 else raw
+
+# ── 4. EV calculation ─────────────────────────────────────────────────────────
+def fee(price_cents):
+    """Kalshi taker fee in cents."""
+    p = price_cents / 100
+    return KALSHI_FEE_RATE * p * (1 - p) * 100
+
+def ev_pct(price_cents, true_prob):
+    """
+    EV as % of stake for buying YES at price_cents given true_prob.
+    Accounts for fee on entry.
+    """
+    profit = (100 - price_cents) - fee(price_cents)
+    loss   = price_cents
+    ev     = true_prob * profit - (1 - true_prob) * loss
+    return (ev / price_cents * 100) if price_cents > 0 else 0
+
+def evaluate(buckets, probs):
+    results = []
+    for b in buckets:
+        mp = probs.get(b["label"])
+        if mp is None:
+            continue
+
+        ev_y = ev_pct(b["yes_ask"], mp)
+        ev_n = ev_pct(b["no_ask"],  1 - mp)
+        gap  = mp * 100 - b["mkt_yes"] * 100
+
+        if   ev_y >= ev_n and ev_y >= MIN_EV_FLAG:  best, best_ev = "BUY YES", ev_y
+        elif ev_n > ev_y  and ev_n >= MIN_EV_FLAG:  best, best_ev = "BUY NO",  ev_n
+        else:                                         best, best_ev = "—",       max(ev_y, ev_n)
+
+        results.append({**b,
+            "model_prob": mp,
+            "gap_pts":    gap,
+            "ev_yes":     ev_y,
+            "ev_no":      ev_n,
+            "best":       best,
+            "best_ev":    best_ev,
+        })
+    return results
+
+# ── 5. Display ────────────────────────────────────────────────────────────────
+def display(results, forecast_high, sigma, day_temps, target_date):
+    now = datetime.now().strftime("%H:%M PT")
+    print(f"\n{'═'*72}")
+    print(f"  MIAMI HIGH TEMP MARKET  —  {target_date}  (as of {now})")
+    print(f"  NWS KMIA forecast high: {forecast_high:.1f}°F  σ={sigma:.1f}°F  "
+          f"({len(day_temps)} daytime periods)")
+    if day_temps:
+        sample = "  ".join(f"{h:02d}h:{t:.0f}°" for h, t in day_temps[:6])
+        print(f"  Hourly sample (local): {sample}")
+    print(f"{'═'*72}")
+    print(f"  {'Bucket':<16} {'Mkt%':>5} {'Mdl%':>5} {'Gap':>6} "
+          f"{'EV-YES':>7} {'EV-NO':>7} {'Fee':>5}  Trade")
+    print(f"  {'─'*68}")
+
+    flagged = []
+    for r in results:
+        flag = f"★ {r['best']}" if r["best"] != "—" else "  —"
+        print(f"  {r['label']:<16} "
+              f"{r['mkt_yes']*100:>4.0f}% "
+              f"{r['model_prob']*100:>4.0f}% "
+              f"{r['gap_pts']:>+5.0f}pt "
+              f"{r['ev_yes']:>+6.0f}% "
+              f"{r['ev_no']:>+6.0f}% "
+              f"{fee(r['yes_ask']):>4.1f}¢  "
+              f"{flag}")
+        if r["best"] != "—":
+            flagged.append(r)
+
+    if flagged:
+        print(f"\n  FLAGGED (EV > {MIN_EV_FLAG}%)")
+        print(f"  {'─'*68}")
+        for r in sorted(flagged, key=lambda x: -x["best_ev"]):
+            price    = r["yes_ask"] if r["best"] == "BUY YES" else r["no_ask"]
+            true_p   = r["model_prob"] if r["best"] == "BUY YES" else 1 - r["model_prob"]
+            net_prof = (100 - price) - fee(price)
+            print(f"\n  {r['best']} {r['label']}")
+            print(f"    Price {price}¢  |  model {true_p*100:.1f}%  "
+                  f"market {(r['mkt_yes'] if r['best']=='BUY YES' else r['mkt_no'])*100:.1f}%")
+            print(f"    Fee {fee(price):.2f}¢  |  net profit if right: {net_prof:.1f}¢  "
+                  f"|  EV {r['best_ev']:+.1f}%")
+    else:
+        print(f"\n  No trades exceed {MIN_EV_FLAG}% EV threshold.")
+
+    print(f"\n{'═'*72}\n")
+
+# ── 6. Main ───────────────────────────────────────────────────────────────────
+def main():
+    # Target: tomorrow (markets open today for tomorrow's high)
+    tomorrow = (datetime.now() + timedelta(days=1))
+    target_iso = tomorrow.strftime("%Y-%m-%d")
+
+    print(f"\nMiami EV Analyzer — target date: {target_iso}")
+    print("─" * 40)
+
+    print("Fetching Kalshi markets...")
+    buckets = fetch_kalshi_markets(target_iso)
+    if not buckets:
+        # Try today's markets if tomorrow not open yet
+        today_iso = datetime.now().strftime("%Y-%m-%d")
+        print(f"  No tomorrow markets, trying today ({today_iso})...")
+        buckets = fetch_kalshi_markets(today_iso)
+        target_iso = today_iso
+
+    if not buckets:
+        print("No open markets found.")
+        return
+
+    print(f"  Parsed {len(buckets)} buckets")
+
+    forecast_high, sigma, day_temps = fetch_nws_grid(target_iso)
+    if forecast_high is None:
+        print("NWS fetch failed.")
+        return
+
+    print(f"  Forecast high: {forecast_high:.1f}°F  σ={sigma:.1f}°F")
+
+    probs   = model_probs(buckets, forecast_high, sigma)
+    results = evaluate(buckets, probs)
+    display(results, forecast_high, sigma, day_temps, target_iso)
+
+if __name__ == "__main__":
+    main()
