@@ -20,6 +20,7 @@ Runs automatically every 30 minutes via GitHub Actions.
 """
 
 import csv
+import os
 import re
 import sqlite3
 import time
@@ -38,6 +39,15 @@ NWS_GRIDPOINTS_BASE = "https://api.weather.gov/gridpoints"
 NWS_HEADERS        = {"User-Agent": "(weather-tracker, research)"}
 OPEN_METEO_DAYS    = 7
 STATION_POLL_DELAY = 0.5   # seconds between stations (NWS rate limiting)
+
+
+def should_export_csv() -> bool:
+    override = os.getenv("ENABLE_CSV_EXPORT", "").strip().lower()
+    if override in {"1", "true", "yes", "on"}:
+        return True
+    if override in {"0", "false", "no", "off"}:
+        return False
+    return os.getenv("GITHUB_ACTIONS", "").strip().lower() == "true"
 
 # ── Station config ─────────────────────────────────────────────────────────────
 # Key: ICAO code used by NWS CLI report (Kalshi settlement source)
@@ -649,15 +659,20 @@ def main() -> None:
             "INSERT INTO run_log (run_at, duration_s, stations_ok, stations_err) VALUES (?,?,?,?)",
             (run_at, round(duration, 2), ok, err),
         )
-    csv_counts = export_run_to_csv(conn2, run_at)
+    csv_counts = {}
+    if should_export_csv():
+        csv_counts = export_run_to_csv(conn2, run_at)
     conn2.close()
 
-    print(
-        f"CSV rows appended — kalshi:{csv_counts.get('kalshi_snapshots', 0)}  "
-        f"nws_hourly:{csv_counts.get('nws_hourly_snapshots', 0)}  "
-        f"nws_periods:{csv_counts.get('nws_period_snapshots', 0)}  "
-        f"openmeteo:{csv_counts.get('openmeteo_snapshots', 0)}"
-    )
+    if csv_counts:
+        print(
+            f"CSV rows appended — kalshi:{csv_counts.get('kalshi_snapshots', 0)}  "
+            f"nws_hourly:{csv_counts.get('nws_hourly_snapshots', 0)}  "
+            f"nws_periods:{csv_counts.get('nws_period_snapshots', 0)}  "
+            f"openmeteo:{csv_counts.get('openmeteo_snapshots', 0)}"
+        )
+    else:
+        print("CSV export skipped (local run). Set ENABLE_CSV_EXPORT=1 to force export.")
 
 
 def export_run_to_csv(conn: sqlite3.Connection, run_at: str) -> dict:

@@ -1,4 +1,4 @@
-name: Weather Tracker
+name: Paper Trader
 
 on:
   schedule:
@@ -6,11 +6,11 @@ on:
   workflow_dispatch:
 
 concurrency:
-  group: tracker
+  group: paper-trader
   cancel-in-progress: false
 
 jobs:
-  track:
+  paper:
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -28,14 +28,14 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
-      - name: Run tracker
-        run: python tracker.py
+      - name: Run paper trader cycle
+        run: python weather_trade_agent.py
 
-      - name: Commit data
+      - name: Commit paper logs
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add data/
-          git diff --staged --quiet || git commit -m "data: $(date -u +%Y-%m-%dT%H:%MZ)"
+          git add data/paper/
+          git diff --staged --quiet || git commit -m "paper: $(date -u +%Y-%m-%dT%H:%MZ)"
           git pull --rebase origin main
           git push
