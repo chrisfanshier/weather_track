@@ -15,6 +15,8 @@ Settlement source: NWS Daily Climatological Report (CLI) per Kalshi rulebooks.
 
 Usage:
     python tracker.py
+
+Runs automatically every 30 minutes via GitHub Actions.
 """
 
 import csv
