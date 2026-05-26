@@ -33,8 +33,10 @@ import requests
 DB_PATH            = Path(__file__).parent / "weather_track.db"
 DATA_DIR           = Path(__file__).parent / "data"
 KALSHI_BASE        = "https://external-api.kalshi.com/trade-api/v2"
+OPEN_METEO_BASE    = "https://api.open-meteo.com/v1/forecast"
 NWS_GRIDPOINTS_BASE = "https://api.weather.gov/gridpoints"
 NWS_HEADERS        = {"User-Agent": "(weather-tracker, research)"}
+OPEN_METEO_DAYS    = 7
 STATION_POLL_DELAY = 0.5   # seconds between stations (NWS rate limiting)
 
 # ── Station config ─────────────────────────────────────────────────────────────
@@ -219,6 +221,17 @@ def init_db(conn: sqlite3.Connection) -> None:
             detailed_fcst TEXT
         );
 
+        CREATE TABLE IF NOT EXISTS openmeteo_snapshots (
+            id            INTEGER PRIMARY KEY AUTOINCREMENT,
+            run_at        TEXT    NOT NULL,
+            icao          TEXT    NOT NULL,
+            forecast_date TEXT    NOT NULL,
+            high_f        REAL,
+            low_f         REAL
+        );
+        CREATE INDEX IF NOT EXISTS idx_openmeteo_run_icao
+            ON openmeteo_snapshots(run_at, icao);
+
         CREATE TABLE IF NOT EXISTS run_log (
             id           INTEGER PRIMARY KEY AUTOINCREMENT,
             run_at       TEXT    NOT NULL,
@@ -396,6 +409,35 @@ def fetch_nws_hourly(nws_grid: str) -> list:
     return rows
 
 
+def fetch_openmeteo(lat: float, lon: float, tz: str) -> list[dict]:
+    params = {
+        "latitude": lat,
+        "longitude": lon,
+        "daily": "temperature_2m_max,temperature_2m_min",
+        "temperature_unit": "fahrenheit",
+        "timezone": tz,
+        "forecast_days": OPEN_METEO_DAYS,
+    }
+    last_error = None
+    for _ in range(2):
+        try:
+            resp = requests.get(OPEN_METEO_BASE, params=params, timeout=15)
+            resp.raise_for_status()
+            data = resp.json()
+            daily = data["daily"]
+            return [
+                {"forecast_date": date_str, "high_f": high_f, "low_f": low_f}
+                for date_str, high_f, low_f in zip(
+                    daily["time"],
+                    daily["temperature_2m_max"],
+                    daily["temperature_2m_min"],
+                )
+            ]
+        except (requests.RequestException, KeyError) as exc:
+            last_error = exc
+    raise RuntimeError(f"Open-Meteo failed after retries: {last_error}")
+
+
 def fetch_nws_periods(nws_grid: str) -> list:
     """
     Fetch NWS text period forecast (~14 named periods). Returns list of dicts:
@@ -429,6 +471,7 @@ def store_snapshot(
     kalshi_rows: list,
     hourly_rows: list,
     period_rows: list,
+    openmeteo_rows: list,
 ) -> None:
     with conn:
         if kalshi_rows:
@@ -472,6 +515,17 @@ def store_snapshot(
                 ],
             )
 
+        if openmeteo_rows:
+            conn.executemany(
+                """INSERT INTO openmeteo_snapshots
+                     (run_at, icao, forecast_date, high_f, low_f)
+                   VALUES (?,?,?,?,?)""",
+                [
+                    (run_at, icao, r["forecast_date"], r["high_f"], r["low_f"])
+                    for r in openmeteo_rows
+                ],
+            )
+
 
 # ── Per-station poll ───────────────────────────────────────────────────────────
 
@@ -492,6 +546,7 @@ def run_station(
         "kalshi_n":  0,
         "hourly_n":  0,
         "periods_n": 0,
+        "openmeteo_n": 0,
         "error":     None,
     }
     errors = []
@@ -528,15 +583,23 @@ def run_station(
     except Exception as e:
         errors.append(f"NWS periods: {e}")
 
+    # --- Open-Meteo daily highs/lows ---
+    openmeteo_rows = []
+    try:
+        openmeteo_rows = fetch_openmeteo(info["lat"], info["lon"], info["tz"])
+    except Exception as e:
+        errors.append(f"Open-Meteo: {e}")
+
     # --- Persist whatever we collected ---
     try:
-        store_snapshot(conn, run_at, icao, kalshi_rows, hourly_rows, period_rows)
+        store_snapshot(conn, run_at, icao, kalshi_rows, hourly_rows, period_rows, openmeteo_rows)
     except Exception as e:
         errors.append(f"DB: {e}")
 
     status["kalshi_n"]  = len(kalshi_rows)
     status["hourly_n"]  = len(hourly_rows)
     status["periods_n"] = len(period_rows)
+    status["openmeteo_n"] = len(openmeteo_rows)
     if errors:
         status["error"] = " | ".join(errors)
     return status
@@ -549,7 +612,7 @@ def main() -> None:
     t_start = time.time()
 
     print(f"tracker.py — {run_at}")
-    print("─" * 68)
+    print("─" * 80)
 
     conn = sqlite3.connect(DB_PATH)
     init_db(conn)
@@ -561,10 +624,11 @@ def main() -> None:
 
         flag       = "✗" if status["error"] else "✓"
         kalshi_str = f"Kalshi:{status['kalshi_n']:>3}" if status["kalshi_n"] else "Kalshi: --"
+        openmeteo_str = f"OMet:{status['openmeteo_n']:>2}" if status["openmeteo_n"] else "OMet:--"
         err_note   = f"  ERR: {status['error'][:55]}" if status["error"] else ""
         print(
             f"  {icao:<5}  {info['name']:<18}  {kalshi_str}  "
-            f"Hrly:{status['hourly_n']:>3}  Per:{status['periods_n']:>2}  {flag}{err_note}"
+            f"Hrly:{status['hourly_n']:>3}  Per:{status['periods_n']:>2}  {openmeteo_str}  {flag}{err_note}"
         )
 
         time.sleep(STATION_POLL_DELAY)
@@ -574,7 +638,7 @@ def main() -> None:
     ok  = sum(1 for r in results if not r["error"])
     err = sum(1 for r in results if r["error"])
 
-    print("─" * 68)
+    print("─" * 80)
     print(f"Done. {ok}/{len(results)} OK, {err} errors.  "
           f"Elapsed: {duration:.1f}s  DB: {DB_PATH.name}")
 
@@ -591,7 +655,8 @@ def main() -> None:
     print(
         f"CSV rows appended — kalshi:{csv_counts.get('kalshi_snapshots', 0)}  "
         f"nws_hourly:{csv_counts.get('nws_hourly_snapshots', 0)}  "
-        f"nws_periods:{csv_counts.get('nws_period_snapshots', 0)}"
+        f"nws_periods:{csv_counts.get('nws_period_snapshots', 0)}  "
+        f"openmeteo:{csv_counts.get('openmeteo_snapshots', 0)}"
     )
 
 
@@ -602,6 +667,7 @@ def export_run_to_csv(conn: sqlite3.Connection, run_at: str) -> dict:
         ("kalshi_snapshots",     DATA_DIR / "kalshi"     / f"{date_str}.csv"),
         ("nws_hourly_snapshots", DATA_DIR / "nws_hourly" / f"{date_str}.csv"),
         ("nws_period_snapshots", DATA_DIR / "nws_periods"/ f"{date_str}.csv"),
+        ("openmeteo_snapshots",  DATA_DIR / "openmeteo"  / f"{date_str}.csv"),
     ]
     counts = {}
     for table, path in tables:
