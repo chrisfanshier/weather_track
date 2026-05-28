@@ -20,9 +20,11 @@ Runs automatically every 30 minutes via GitHub Actions.
 """
 
 import csv
+import math
 import os
 import re
 import sqlite3
+import statistics
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -34,8 +36,9 @@ import requests
 DB_PATH            = Path(__file__).parent / "weather_track.db"
 DATA_DIR           = Path(__file__).parent / "data"
 KALSHI_BASE        = "https://external-api.kalshi.com/trade-api/v2"
-OPEN_METEO_BASE    = "https://api.open-meteo.com/v1/forecast"
-NWS_GRIDPOINTS_BASE = "https://api.weather.gov/gridpoints"
+OPEN_METEO_BASE          = "https://api.open-meteo.com/v1/forecast"
+OPEN_METEO_ENSEMBLE_BASE = "https://ensemble-api.open-meteo.com/v1/ensemble"
+NWS_GRIDPOINTS_BASE      = "https://api.weather.gov/gridpoints"
 NWS_HEADERS        = {"User-Agent": "(weather-tracker, research)"}
 OPEN_METEO_DAYS    = 7
 STATION_POLL_DELAY = 0.5   # seconds between stations (NWS rate limiting)
@@ -241,6 +244,24 @@ def init_db(conn: sqlite3.Connection) -> None:
         );
         CREATE INDEX IF NOT EXISTS idx_openmeteo_run_icao
             ON openmeteo_snapshots(run_at, icao);
+
+        CREATE TABLE IF NOT EXISTS openmeteo_ensemble_snapshots (
+            id            INTEGER PRIMARY KEY AUTOINCREMENT,
+            run_at        TEXT    NOT NULL,
+            icao          TEXT    NOT NULL,
+            forecast_date TEXT    NOT NULL,
+            kind          TEXT    NOT NULL,
+            n_members     INTEGER,
+            mean_f        REAL,
+            sd_f          REAL,
+            p10_f         REAL,
+            p50_f         REAL,
+            p90_f         REAL,
+            min_f         REAL,
+            max_f         REAL
+        );
+        CREATE INDEX IF NOT EXISTS idx_oens_run_icao
+            ON openmeteo_ensemble_snapshots(run_at, icao);
 
         CREATE TABLE IF NOT EXISTS run_log (
             id           INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -448,6 +469,68 @@ def fetch_openmeteo(lat: float, lon: float, tz: str) -> list[dict]:
     raise RuntimeError(f"Open-Meteo failed after retries: {last_error}")
 
 
+def fetch_openmeteo_ensemble(lat: float, lon: float, tz: str) -> dict:
+    """Fetch Open-Meteo ensemble forecast (50 members, 3-day window)."""
+    params = {
+        "latitude":         lat,
+        "longitude":        lon,
+        "timezone":         tz,
+        "temperature_unit": "fahrenheit",
+        "forecast_days":    3,
+        "hourly":           "temperature_2m",
+    }
+    last_error = None
+    for _ in range(2):
+        try:
+            resp = requests.get(OPEN_METEO_ENSEMBLE_BASE, params=params, timeout=30)
+            resp.raise_for_status()
+            return resp.json()
+        except (requests.RequestException, KeyError) as exc:
+            last_error = exc
+    raise RuntimeError(f"Open-Meteo ensemble failed after retries: {last_error}")
+
+
+def ensemble_member_extremes(payload: dict, target_date: str, kind: str) -> list[float]:
+    """Extract per-member daily high or low from an ensemble payload dict."""
+    hourly      = payload.get("hourly", {})
+    times       = hourly.get("time", [])
+    member_keys = [k for k in hourly if k.startswith("temperature_2m_member")]
+    extremes    = []
+    for key in member_keys:
+        vals     = hourly.get(key, [])
+        day_vals = [float(v) for t, v in zip(times, vals)
+                    if v is not None and str(t).startswith(target_date)]
+        if day_vals:
+            extremes.append(max(day_vals) if kind == "high" else min(day_vals))
+    return extremes
+
+
+def ensemble_daily_summary(member_vals: list[float]) -> dict:
+    """Raw ensemble distribution stats — no bucket logic, just the distribution."""
+    n = len(member_vals)
+    if n == 0:
+        return {"n_members": 0, "mean_f": None, "sd_f": None,
+                "p10_f": None, "p50_f": None, "p90_f": None,
+                "min_f": None, "max_f": None}
+    sv = sorted(member_vals)
+
+    def _pct(p: float) -> float:
+        k = (n - 1) * p
+        lo, hi = int(k), min(int(k) + 1, n - 1)
+        return sv[lo] + (k - lo) * (sv[hi] - sv[lo])
+
+    return {
+        "n_members": n,
+        "mean_f":    round(statistics.mean(sv), 2),
+        "sd_f":      round(statistics.pstdev(sv), 2),
+        "p10_f":     round(_pct(0.10), 2),
+        "p50_f":     round(_pct(0.50), 2),
+        "p90_f":     round(_pct(0.90), 2),
+        "min_f":     round(sv[0], 2),
+        "max_f":     round(sv[-1], 2),
+    }
+
+
 def fetch_nws_periods(nws_grid: str) -> list:
     """
     Fetch NWS text period forecast (~14 named periods). Returns list of dicts:
@@ -482,6 +565,7 @@ def store_snapshot(
     hourly_rows: list,
     period_rows: list,
     openmeteo_rows: list,
+    ensemble_rows: list,
 ) -> None:
     with conn:
         if kalshi_rows:
@@ -536,6 +620,20 @@ def store_snapshot(
                 ],
             )
 
+        if ensemble_rows:
+            conn.executemany(
+                """INSERT INTO openmeteo_ensemble_snapshots
+                     (run_at, icao, forecast_date, kind,
+                      n_members, mean_f, sd_f, p10_f, p50_f, p90_f, min_f, max_f)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+                [
+                    (run_at, icao, r["forecast_date"], r["kind"],
+                     r["n_members"], r["mean_f"], r["sd_f"],
+                     r["p10_f"], r["p50_f"], r["p90_f"], r["min_f"], r["max_f"])
+                    for r in ensemble_rows
+                ],
+            )
+
 
 # ── Per-station poll ───────────────────────────────────────────────────────────
 
@@ -551,13 +649,14 @@ def run_station(
     so that a single bad station does not abort the whole run.
     """
     status = {
-        "icao":      icao,
-        "name":      info["name"],
-        "kalshi_n":  0,
-        "hourly_n":  0,
-        "periods_n": 0,
+        "icao":       icao,
+        "name":       info["name"],
+        "kalshi_n":   0,
+        "hourly_n":   0,
+        "periods_n":  0,
         "openmeteo_n": 0,
-        "error":     None,
+        "ensemble_n": 0,
+        "error":      None,
     }
     errors = []
 
@@ -600,16 +699,36 @@ def run_station(
     except Exception as e:
         errors.append(f"Open-Meteo: {e}")
 
+    # --- Open-Meteo ensemble (50-member, 3-day) ---
+    ensemble_rows = []
+    try:
+        ens_payload = fetch_openmeteo_ensemble(info["lat"], info["lon"], info["tz"])
+        ens_dates = sorted({
+            str(t)[:10]
+            for t in ens_payload.get("hourly", {}).get("time", [])
+        })
+        for forecast_date in ens_dates:
+            for kind in ("high", "low"):
+                member_vals = ensemble_member_extremes(ens_payload, forecast_date, kind)
+                summary = ensemble_daily_summary(member_vals)
+                if summary["n_members"] > 0:
+                    summary["forecast_date"] = forecast_date
+                    summary["kind"] = kind
+                    ensemble_rows.append(summary)
+    except Exception as e:
+        errors.append(f"Open-Meteo ensemble: {e}")
+
     # --- Persist whatever we collected ---
     try:
-        store_snapshot(conn, run_at, icao, kalshi_rows, hourly_rows, period_rows, openmeteo_rows)
+        store_snapshot(conn, run_at, icao, kalshi_rows, hourly_rows, period_rows, openmeteo_rows, ensemble_rows)
     except Exception as e:
         errors.append(f"DB: {e}")
 
-    status["kalshi_n"]  = len(kalshi_rows)
-    status["hourly_n"]  = len(hourly_rows)
-    status["periods_n"] = len(period_rows)
+    status["kalshi_n"]    = len(kalshi_rows)
+    status["hourly_n"]    = len(hourly_rows)
+    status["periods_n"]   = len(period_rows)
     status["openmeteo_n"] = len(openmeteo_rows)
+    status["ensemble_n"]  = len(ensemble_rows)
     if errors:
         status["error"] = " | ".join(errors)
     return status
@@ -632,13 +751,15 @@ def main() -> None:
         status = run_station(conn, run_at, icao, info)
         results.append(status)
 
-        flag       = "✗" if status["error"] else "✓"
-        kalshi_str = f"Kalshi:{status['kalshi_n']:>3}" if status["kalshi_n"] else "Kalshi: --"
+        flag         = "✗" if status["error"] else "✓"
+        kalshi_str   = f"Kalshi:{status['kalshi_n']:>3}" if status["kalshi_n"] else "Kalshi: --"
         openmeteo_str = f"OMet:{status['openmeteo_n']:>2}" if status["openmeteo_n"] else "OMet:--"
-        err_note   = f"  ERR: {status['error'][:55]}" if status["error"] else ""
+        ensemble_str = f"Ens:{status['ensemble_n']:>2}" if status["ensemble_n"] else "Ens:--"
+        err_note     = f"  ERR: {status['error'][:55]}" if status["error"] else ""
         print(
             f"  {icao:<5}  {info['name']:<18}  {kalshi_str}  "
-            f"Hrly:{status['hourly_n']:>3}  Per:{status['periods_n']:>2}  {openmeteo_str}  {flag}{err_note}"
+            f"Hrly:{status['hourly_n']:>3}  Per:{status['periods_n']:>2}  "
+            f"{openmeteo_str}  {ensemble_str}  {flag}{err_note}"
         )
 
         time.sleep(STATION_POLL_DELAY)
@@ -669,7 +790,8 @@ def main() -> None:
             f"CSV rows appended — kalshi:{csv_counts.get('kalshi_snapshots', 0)}  "
             f"nws_hourly:{csv_counts.get('nws_hourly_snapshots', 0)}  "
             f"nws_periods:{csv_counts.get('nws_period_snapshots', 0)}  "
-            f"openmeteo:{csv_counts.get('openmeteo_snapshots', 0)}"
+            f"openmeteo:{csv_counts.get('openmeteo_snapshots', 0)}  "
+            f"ensemble:{csv_counts.get('openmeteo_ensemble_snapshots', 0)}"
         )
     else:
         print("CSV export skipped (local run). Set ENABLE_CSV_EXPORT=1 to force export.")
@@ -679,10 +801,11 @@ def export_run_to_csv(conn: sqlite3.Connection, run_at: str) -> dict:
     """Append this run's rows to date-partitioned CSV files under data/."""
     date_str = run_at[:10]
     tables = [
-        ("kalshi_snapshots",     DATA_DIR / "kalshi"     / f"{date_str}.csv"),
-        ("nws_hourly_snapshots", DATA_DIR / "nws_hourly" / f"{date_str}.csv"),
-        ("nws_period_snapshots", DATA_DIR / "nws_periods"/ f"{date_str}.csv"),
-        ("openmeteo_snapshots",  DATA_DIR / "openmeteo"  / f"{date_str}.csv"),
+        ("kalshi_snapshots",             DATA_DIR / "kalshi"             / f"{date_str}.csv"),
+        ("nws_hourly_snapshots",         DATA_DIR / "nws_hourly"         / f"{date_str}.csv"),
+        ("nws_period_snapshots",         DATA_DIR / "nws_periods"        / f"{date_str}.csv"),
+        ("openmeteo_snapshots",          DATA_DIR / "openmeteo"          / f"{date_str}.csv"),
+        ("openmeteo_ensemble_snapshots", DATA_DIR / "openmeteo_ensemble" / f"{date_str}.csv"),
     ]
     counts = {}
     for table, path in tables:
