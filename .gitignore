@@ -1,4 +1,5 @@
 weather_track.db
+weather_paper.db
 __pycache__/
 *.pyc
 *.py[cod]
