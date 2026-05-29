@@ -42,6 +42,13 @@ NWS_GRIDPOINTS_BASE      = "https://api.weather.gov/gridpoints"
 NWS_HEADERS        = {"User-Agent": "(weather-tracker, research)"}
 OPEN_METEO_DAYS    = 7
 STATION_POLL_DELAY = 0.5   # seconds between stations (NWS rate limiting)
+MODEL_FAMILY_MODELS = [
+    "gfs_seamless",
+    "icon_global",
+    "gem_global",
+    "ecmwf_ifs025",
+    "ukmo_global_deterministic_10km",
+]
 
 
 def should_export_csv() -> bool:
@@ -262,6 +269,20 @@ def init_db(conn: sqlite3.Connection) -> None:
         );
         CREATE INDEX IF NOT EXISTS idx_oens_run_icao
             ON openmeteo_ensemble_snapshots(run_at, icao);
+
+        CREATE TABLE IF NOT EXISTS model_family_snapshots (
+            id            INTEGER PRIMARY KEY AUTOINCREMENT,
+            run_at        TEXT    NOT NULL,
+            icao          TEXT    NOT NULL,
+            forecast_date TEXT    NOT NULL,
+            model_name    TEXT    NOT NULL,
+            high_f        REAL,
+            low_f         REAL
+        );
+        CREATE INDEX IF NOT EXISTS idx_model_family_run_icao
+            ON model_family_snapshots(run_at, icao);
+        CREATE INDEX IF NOT EXISTS idx_model_family_date_model
+            ON model_family_snapshots(forecast_date, model_name);
 
         CREATE TABLE IF NOT EXISTS run_log (
             id           INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -531,6 +552,37 @@ def ensemble_daily_summary(member_vals: list[float]) -> dict:
     }
 
 
+def fetch_model_family_forecasts(lat: float, lon: float, tz: str) -> list[dict]:
+    """Fetch daily high/low for each named deterministic model family (one batch call)."""
+    params = {
+        "latitude":         lat,
+        "longitude":        lon,
+        "timezone":         tz,
+        "temperature_unit": "fahrenheit",
+        "forecast_days":    3,
+        "daily":            "temperature_2m_max,temperature_2m_min",
+        "models":           ",".join(MODEL_FAMILY_MODELS),
+    }
+    resp = requests.get(OPEN_METEO_BASE, params=params, timeout=15)
+    resp.raise_for_status()
+    daily = resp.json().get("daily", {})
+    dates = daily.get("time", [])
+    rows = []
+    for model in MODEL_FAMILY_MODELS:
+        max_key = f"temperature_2m_max_{model}"
+        min_key = f"temperature_2m_min_{model}"
+        highs = daily.get(max_key, [])
+        lows  = daily.get(min_key, [])
+        for date_str, high_f, low_f in zip(dates, highs, lows):
+            rows.append({
+                "forecast_date": date_str,
+                "model_name":    model,
+                "high_f":        high_f,
+                "low_f":         low_f,
+            })
+    return rows
+
+
 def fetch_nws_periods(nws_grid: str) -> list:
     """
     Fetch NWS text period forecast (~14 named periods). Returns list of dicts:
@@ -566,6 +618,7 @@ def store_snapshot(
     period_rows: list,
     openmeteo_rows: list,
     ensemble_rows: list,
+    model_family_rows: list,
 ) -> None:
     with conn:
         if kalshi_rows:
@@ -634,6 +687,18 @@ def store_snapshot(
                 ],
             )
 
+        if model_family_rows:
+            conn.executemany(
+                """INSERT INTO model_family_snapshots
+                     (run_at, icao, forecast_date, model_name, high_f, low_f)
+                   VALUES (?,?,?,?,?,?)""",
+                [
+                    (run_at, icao, r["forecast_date"], r["model_name"],
+                     r["high_f"], r["low_f"])
+                    for r in model_family_rows
+                ],
+            )
+
 
 # ── Per-station poll ───────────────────────────────────────────────────────────
 
@@ -649,14 +714,15 @@ def run_station(
     so that a single bad station does not abort the whole run.
     """
     status = {
-        "icao":       icao,
-        "name":       info["name"],
-        "kalshi_n":   0,
-        "hourly_n":   0,
-        "periods_n":  0,
-        "openmeteo_n": 0,
-        "ensemble_n": 0,
-        "error":      None,
+        "icao":             icao,
+        "name":             info["name"],
+        "kalshi_n":         0,
+        "hourly_n":         0,
+        "periods_n":        0,
+        "openmeteo_n":      0,
+        "ensemble_n":       0,
+        "model_family_n":   0,
+        "error":            None,
     }
     errors = []
 
@@ -718,17 +784,26 @@ def run_station(
     except Exception as e:
         errors.append(f"Open-Meteo ensemble: {e}")
 
+    # --- Open-Meteo model family (deterministic, 5 named models, 3-day) ---
+    model_family_rows = []
+    try:
+        model_family_rows = fetch_model_family_forecasts(info["lat"], info["lon"], info["tz"])
+    except Exception as e:
+        errors.append(f"Open-Meteo model family: {e}")
+
     # --- Persist whatever we collected ---
     try:
-        store_snapshot(conn, run_at, icao, kalshi_rows, hourly_rows, period_rows, openmeteo_rows, ensemble_rows)
+        store_snapshot(conn, run_at, icao, kalshi_rows, hourly_rows, period_rows,
+                       openmeteo_rows, ensemble_rows, model_family_rows)
     except Exception as e:
         errors.append(f"DB: {e}")
 
-    status["kalshi_n"]    = len(kalshi_rows)
-    status["hourly_n"]    = len(hourly_rows)
-    status["periods_n"]   = len(period_rows)
-    status["openmeteo_n"] = len(openmeteo_rows)
-    status["ensemble_n"]  = len(ensemble_rows)
+    status["kalshi_n"]        = len(kalshi_rows)
+    status["hourly_n"]        = len(hourly_rows)
+    status["periods_n"]       = len(period_rows)
+    status["openmeteo_n"]     = len(openmeteo_rows)
+    status["ensemble_n"]      = len(ensemble_rows)
+    status["model_family_n"]  = len(model_family_rows)
     if errors:
         status["error"] = " | ".join(errors)
     return status
@@ -755,11 +830,12 @@ def main() -> None:
         kalshi_str   = f"Kalshi:{status['kalshi_n']:>3}" if status["kalshi_n"] else "Kalshi: --"
         openmeteo_str = f"OMet:{status['openmeteo_n']:>2}" if status["openmeteo_n"] else "OMet:--"
         ensemble_str = f"Ens:{status['ensemble_n']:>2}" if status["ensemble_n"] else "Ens:--"
+        mf_str       = f"MF:{status['model_family_n']:>2}" if status["model_family_n"] else "MF:--"
         err_note     = f"  ERR: {status['error'][:55]}" if status["error"] else ""
         print(
             f"  {icao:<5}  {info['name']:<18}  {kalshi_str}  "
             f"Hrly:{status['hourly_n']:>3}  Per:{status['periods_n']:>2}  "
-            f"{openmeteo_str}  {ensemble_str}  {flag}{err_note}"
+            f"{openmeteo_str}  {ensemble_str}  {mf_str}  {flag}{err_note}"
         )
 
         time.sleep(STATION_POLL_DELAY)
@@ -791,7 +867,8 @@ def main() -> None:
             f"nws_hourly:{csv_counts.get('nws_hourly_snapshots', 0)}  "
             f"nws_periods:{csv_counts.get('nws_period_snapshots', 0)}  "
             f"openmeteo:{csv_counts.get('openmeteo_snapshots', 0)}  "
-            f"ensemble:{csv_counts.get('openmeteo_ensemble_snapshots', 0)}"
+            f"ensemble:{csv_counts.get('openmeteo_ensemble_snapshots', 0)}  "
+            f"model_family:{csv_counts.get('model_family_snapshots', 0)}"
         )
     else:
         print("CSV export skipped (local run). Set ENABLE_CSV_EXPORT=1 to force export.")
@@ -806,6 +883,7 @@ def export_run_to_csv(conn: sqlite3.Connection, run_at: str) -> dict:
         ("nws_period_snapshots",         DATA_DIR / "nws_periods"        / f"{date_str}.csv"),
         ("openmeteo_snapshots",          DATA_DIR / "openmeteo"          / f"{date_str}.csv"),
         ("openmeteo_ensemble_snapshots", DATA_DIR / "openmeteo_ensemble" / f"{date_str}.csv"),
+        ("model_family_snapshots",       DATA_DIR / "model_family"       / f"{date_str}.csv"),
     ]
     counts = {}
     for table, path in tables:
